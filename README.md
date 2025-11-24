@@ -11,6 +11,7 @@ Each robot:
 The simulator runs swarms of such robots in different arena geometries (e.g. torus, disk, star) and shows how they **self-adapt** their microscopic control parameters to reach target macroscopic behaviors (e.g. flocking).
 
 Here is an example for a swarm in a disk-shaped arena self-adapting to a flocking behavior with wall avoidance:
+
 ![Flocking demo](figs/selfadapt/flocking.gif).
 
 ---
