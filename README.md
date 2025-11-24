@@ -10,9 +10,11 @@ Each robot:
 
 The simulator runs swarms of such robots in different arena geometries (e.g. torus, disk, star) and shows how they **self-adapt** their microscopic control parameters to reach target macroscopic behaviors (e.g. flocking).
 
-Here is an example for a swarm in a disk-shaped arena self-adapting to a flocking behavior with wall avoidance:
+Here is an example for a swarm in a disk-shaped arena self-adapting to a flocking behavior with wall avoidance
 
 ![Flocking demo](figs/selfadapt/flocking.gif)
+
+The robot LED colors correspond to the local loss score: green/yellow: low loss, orange/red: high loss, blue: reached loss target (very low loss), so the robot stops learning and always keep the same parameters.
 
 ---
 
