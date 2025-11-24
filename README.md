@@ -12,7 +12,7 @@ The simulator runs swarms of such robots in different arena geometries (e.g. tor
 
 Here is an example for a swarm in a disk-shaped arena self-adapting to a flocking behavior with wall avoidance:
 
-![Flocking demo](figs/selfadapt/flocking.gif).
+![Flocking demo](figs/selfadapt/flocking.gif)
 
 ---
 
