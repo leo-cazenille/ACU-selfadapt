@@ -1,0 +1,91 @@
+# Prerequisites
+*.d
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Kernel Module Compile Results
+*.mod*
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+Mkfile.old
+dkms.conf
+
+# debug information files
+*.dwo
+
+
+# Results files
+frames/
+results/
+arenas
+
+# Build directories
+build
+*/build/
+
+# Binaries
+ACU-selfadapt
+
+# Temp/backup files
+*.back
+*.bak
+conf/tmp.yaml
+
+# Python temp files
+__pycache__
+
+# Latex temp files
+*.aux
+*.log
+
+# Latex result files
+figs/fixed_genotype-flock_center/stats.pdf
+figs/fixed_genotype-flock_center/traces.pdf
+figs/selfadapt/traces.pdf
+
+# Apptainer images
+*.sif
+*.simg
+
+

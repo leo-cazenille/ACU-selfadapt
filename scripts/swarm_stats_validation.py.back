@@ -1,0 +1,649 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Estimator validation for Pogosim logs.
+
+For each estimator produced on-robot (pol, ang4, vort, pers, nb, wall),
+compute a canonical ground-truth time series from poses/headings and compare
+against the robots' push-sum consensus EWMA (and dispersion across robots).
+
+Truth mapping (per your spec):
+  pol  -> global P(t) from all headings (Rayleigh-corrected like locals)
+  ang4 -> A4(t) = |<exp(i*4*theta)>|
+  vort -> spatially averaged (signed) vorticity from gridded velocity field
+  pers -> velocity autocorrelation C_v(Δ*) at same lag Δ* (or fitted τ_p)
+  nb   -> mean degree from the true rc-neighbor graph
+  wall -> wall-contact fraction at same distance threshold d0
+
+Practical rules:
+- Mirror the estimator bandwidth: apply same EWMA alpha as the robots.
+- Keep per-arena and per-run truth series (and per-time dispersion σ_consensus).
+- Fix vorticity coarse-graining (nx, ny); reuse everywhere (locals & truth).
+
+Outputs (in --output):
+  truths_{metric}.csv          # per time, per arena, per run
+  compare_{metric}.csv         # joined consensus vs truth (+error and σ_consensus)
+  SUMMARY_estimator_validation.txt
+"""
+
+from __future__ import annotations
+import os, argparse, json
+import numpy as np
+import pandas as pd
+
+try:
+    from scipy.spatial import cKDTree
+    from scipy.signal import correlate
+except Exception as e:
+    raise ImportError("Please install scipy (KDTree + signal) for this script.") from e
+
+# ------------------------------ I/O helpers -------------------------------- #
+
+def load_df_and_config(input_file: str):
+    """
+    Same style as am.py: returns (df, rc_neighbor, meta_dict)
+
+    rc_neighbor = communication_radius_border + 2*robot_radius  (center-to-center)
+    """
+    try:
+        from pogosim import utils  # type: ignore
+    except Exception:
+        import utils  # type: ignore
+
+    df, meta = utils.load_dataframe(input_file)
+    cfg = meta.get("configuration", {}) if isinstance(meta, dict) else {}
+    robots = cfg.get("objects", {}).get("robots", {})
+    rc = float(robots.get("communication_radius", 80.0)) + 2.0*float(robots.get("radius", 26.5))
+    return df, rc, meta
+
+def ensure_sorted(df: pd.DataFrame) -> pd.DataFrame:
+    keys = [c for c in ['arena_file','run','robot_category','robot_id','time'] if c in df.columns]
+    return df.sort_values(keys, kind='mergesort').reset_index(drop=True)
+
+def _finite_xy(snap: pd.DataFrame) -> pd.DataFrame:
+    """Return only rows with finite x,y for this snapshot."""
+    m = np.isfinite(snap['x'].to_numpy()) & np.isfinite(snap['y'].to_numpy())
+    if m.all():
+        return snap
+    return snap.loc[m]
+
+def _finite_angle(snap: pd.DataFrame) -> pd.DataFrame:
+    if 'angle' not in snap: 
+        return snap
+    m = np.isfinite(snap['angle'].to_numpy())
+    return snap.loc[m]
+
+def align_truth_consensus(truth, truth_col, cons, cons_col, by, time_col="time", tol_factor=0.51):
+    out = []
+    truth = truth.sort_values(by + [time_col])
+    cons  = cons.sort_values(by + [time_col])
+    for key, gT in truth.groupby(by, sort=False):
+        if not isinstance(key, tuple): key = (key,)
+        gC = cons
+        for i, b in enumerate(by):
+            gC = gC[gC[b] == key[i]]
+        if gC.empty or gT.empty:
+            continue
+
+        timesC = gC[time_col].to_numpy()
+        # derive dt from consensus or truth; fall back to 1 frame tolerance
+        dt_c = np.median(np.diff(np.unique(timesC))) if gC[time_col].nunique() > 1 else np.nan
+        timesT = gT[time_col].to_numpy()
+        dt_t = np.median(np.diff(np.unique(timesT))) if gT[time_col].nunique() > 1 else np.nan
+        base_dt = dt_c if np.isfinite(dt_c) and dt_c > 0 else (dt_t if np.isfinite(dt_t) and dt_t > 0 else 1.0)
+        tol = tol_factor * base_dt
+
+        left  = gT[[*by, time_col, truth_col]].drop_duplicates([*by, time_col]).sort_values(time_col)
+        right = gC[[*by, time_col, cons_col]].drop_duplicates([*by, time_col]).sort_values(time_col)
+
+        m = pd.merge_asof(left, right, on=time_col, by=by, direction="nearest", tolerance=tol)
+        if not m.empty:
+            m = m.rename(columns={truth_col: "truth", cons_col: "consensus"})
+            m["error"] = m["consensus"] - m["truth"]
+            out.append(m)
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame(columns=[*by, time_col, "truth","consensus","error"])
+
+
+
+# ----------------------------- Bandwidth mirror ---------------------------- #
+
+def ewma_like_robot(s: pd.Series, alpha: float) -> pd.Series:
+    """Match robot EWMA (same alpha, past-to-present)."""
+    if not np.isfinite(alpha) or alpha <= 0.0 or alpha >= 1.0:
+        return s.copy()
+    # pandas ewm adjust=False equals causal EWMA
+    return s.ewm(alpha=alpha, adjust=False).mean()
+
+def pick_alpha(meta_cfg: dict, key: str, default: float) -> float:
+    """Read EWMA alpha used by the robots for a given metric from YAML."""
+    # In main.c these come from configuration names ewma_alpha_* (see global_setup)
+    # pol, wall, pers, nb, ang4, vort are available. Fallback to default if missing.
+    return float(meta_cfg.get(key, default))
+
+# ----------------------------- Snapshot grouping --------------------------- #
+
+def snapshot_keys(df: pd.DataFrame) -> list[str]:
+    return [c for c in ['arena_file','run','time'] if c in df.columns]
+
+def iter_snapshots(df: pd.DataFrame):
+    keys = snapshot_keys(df)
+    if not keys:
+        yield ((), df)
+        return
+    for k, snap in df.groupby(keys, sort=False):
+        if not isinstance(k, tuple):
+            k = (k,)
+        yield k, snap
+
+# ------------------------------ Basic geometry ----------------------------- #
+
+def infer_box(df: pd.DataFrame):
+    x0 = float(df['x'].min()); x1 = float(df['x'].max())
+    y0 = float(df['y'].min()); y1 = float(df['y'].max())
+    return (x0, x1, y0, y1)
+
+def estimate_velocities(df: pd.DataFrame) -> pd.DataFrame:
+    df = ensure_sorted(df)
+    gcols = [c for c in ['arena_file','run','robot_category','robot_id'] if c in df.columns]
+    out = df.copy()
+    for _, g in out.groupby(gcols, sort=False):
+        idx = g.index.to_numpy()
+        t = g['time'].to_numpy()
+        x = g['x'].to_numpy(); y = g['y'].to_numpy()
+        dt = np.diff(t, prepend=t[0] if t.size else 1.0)
+        dt[dt==0] = 1e-9
+        out.loc[idx, 'vx'] = np.diff(x, prepend=x[0]) / dt
+        out.loc[idx, 'vy'] = np.diff(y, prepend=y[0]) / dt
+    return out
+
+# --------------------------- Metric: global polarization ------------------- #
+
+def rayleigh_corrected_P(angles: np.ndarray) -> float:
+    """Rayleigh small-sample correction like in main.c for locals (N->E0)."""
+    if angles.size == 0:
+        return np.nan
+    sx = np.cos(angles).sum(); sy = np.sin(angles).sum()
+    N = float(angles.size)
+    R_bar = np.hypot(sx, sy) / max(N, 1.0)
+    R0 = np.sqrt(np.pi) / (2.0 * np.sqrt(max(N, 1.0)))
+    P = (R_bar - R0) / (1.0 - R0 + 1e-12)
+    return float(np.clip(P, 0.0, 1.0))
+
+def truth_pol(df: pd.DataFrame) -> pd.DataFrame:
+    keys = snapshot_keys(df)
+    rows = []
+    for key, snap in iter_snapshots(df):
+        snap_ok = _finite_angle(snap)
+        th = snap_ok['angle'].to_numpy()
+        P = rayleigh_corrected_P(th) if th.size else np.nan
+        rows.append((*key, P))
+    return pd.DataFrame(rows, columns=keys+['truth_pol'])
+
+# ----------------------------- Metric: A4 (ang4) --------------------------- #
+
+def truth_ang4(df: pd.DataFrame) -> pd.DataFrame:
+    keys = snapshot_keys(df)
+    rows = []
+    for key, snap in iter_snapshots(df):
+        snap_ok = _finite_angle(snap)
+        th = snap_ok['angle'].to_numpy()
+        z = np.exp(1j*4.0*th) if th.size else np.array([])
+        A4 = float(np.abs(np.mean(z))) if z.size else np.nan
+        rows.append((*key, A4))
+    return pd.DataFrame(rows, columns=keys+['truth_ang4'])
+
+
+# ----------------------------- Metric: vorticity --------------------------- #
+
+def grid_velocity_field(snap: pd.DataFrame, nx=64, ny=64):
+    x0,x1,y0,y1 = infer_box(snap)
+    x_edges = np.linspace(x0, x1, nx+1)
+    y_edges = np.linspace(y0, y1, ny+1)
+    Xc = 0.5*(x_edges[:-1]+x_edges[1:])
+    Yc = 0.5*(y_edges[:-1]+y_edges[1:])
+    U = np.full((ny,nx), np.nan); V = np.full((ny,nx), np.nan); C = np.zeros((ny,nx), dtype=int)
+    ix = np.digitize(snap['x'].to_numpy(), x_edges)-1
+    iy = np.digitize(snap['y'].to_numpy(), y_edges)-1
+    ok = (ix>=0)&(ix<nx)&(iy>=0)&(iy<ny)
+    if ok.any():
+        sumU = np.zeros_like(U); sumV = np.zeros_like(V)
+        vx = snap['vx'].to_numpy(); vy = snap['vy'].to_numpy()
+        for i in np.where(ok)[0]:
+            C[iy[i], ix[i]] += 1
+            sumU[iy[i], ix[i]] += vx[i]
+            sumV[iy[i], ix[i]] += vy[i]
+        nz = C>0
+        U[nz] = sumU[nz] / C[nz]; V[nz] = sumV[nz] / C[nz]
+    return (Xc, Yc, U, V, C, x0,x1,y0,y1)
+
+def vorticity_from_grid(U: np.ndarray, V: np.ndarray, x0,x1,y0,y1):
+    ny,nx = U.shape
+    if nx<2 or ny<2: return np.full_like(U, np.nan)
+    dx = (x1 - x0) / nx; dy = (y1 - y0) / ny
+    dVdx = np.gradient(V, dx, axis=1)
+    dUdy = np.gradient(U, dy, axis=0)
+    return dVdx - dUdy
+
+def truth_vort(df: pd.DataFrame, nx=64, ny=64, mode="abs") -> pd.DataFrame:
+    work = df if {'vx','vy'}.issubset(df.columns) else estimate_velocities(df)
+    keys = snapshot_keys(work)
+    rows = []
+    for key, snap in iter_snapshots(work):
+        snap_ok = _finite_xy(snap)
+        if snap_ok.empty:
+            rows.append((*key, np.nan)); continue
+        _, _, U, V, _, x0,x1,y0,y1 = grid_velocity_field(snap_ok, nx=nx, ny=ny)
+        omega = vorticity_from_grid(U, V, x0,x1,y0,y1)
+        fin = np.isfinite(omega)
+        if not fin.any():
+            m = np.nan
+        else:
+            val = np.abs(omega[fin]) if (mode=="abs") else omega[fin]
+            m = float(val.mean())
+        rows.append((*key, m))
+    return pd.DataFrame(rows, columns=keys+[f"truth_vort_{mode}"])
+
+
+# ------------------------- Metric: velocity persistence -------------------- #
+
+def _cv_at_lag(times: np.ndarray, angles: np.ndarray, lag_s: float) -> float:
+    """
+    Heading-based velocity autocorrelation at lag Δ:
+      C_v(Δ) = < v̂(t) · v̂(t+Δ) >
+    Here v̂ = [cos θ, sin θ], linear-time interpolation to nearest index.
+    Assumes times are monotonic increasing within a (arena, run) snapshot series.
+    """
+    if times.size < 2: return np.nan
+    # Resample to uniform dt to avoid variable-Δ artifacts
+    t0, t1 = times[0], times[-1]
+    if t1 <= t0 or lag_s <= 0: return np.nan
+    dt = np.median(np.diff(times))
+    K = int(np.floor((t1 - t0) / dt)) + 1
+    t = t0 + np.arange(K)*dt
+    # Interpolate angles to uniform grid (unwrap to avoid jumps)
+    th = np.interp(t, times, np.unwrap(angles))
+    v = np.stack((np.cos(th), np.sin(th)), axis=1)
+    k = int(round(lag_s / dt))
+    if k<=0 or k>=len(v): return np.nan
+    dots = (v[:-k] * v[k:]).sum(axis=1)
+    return float(np.mean(dots))
+
+def truth_pers(df: pd.DataFrame, lag_s: float) -> pd.DataFrame:
+    keys = [c for c in ['arena_file','run'] if c in df.columns]
+    rows = []
+    for key_vals, g in df.groupby(keys, sort=False):
+        g_ok = _finite_angle(g)
+        if g_ok.empty:
+            continue
+        times  = g_ok['time'].to_numpy()
+        angles = g_ok['angle'].to_numpy()
+        C = _cv_at_lag(times, angles, lag_s)
+        for ti in np.unique(times):
+            rows.append((*((key_vals,) if not isinstance(key_vals, tuple) else key_vals), ti, C))
+    return pd.DataFrame(rows, columns=keys+['time','truth_pers'])
+
+# --------------------------- Metric: mean degree (nb) ---------------------- #
+
+def truth_nb(df: pd.DataFrame, rc: float) -> pd.DataFrame:
+    keys = snapshot_keys(df)
+    rows = []
+    for key, snap in iter_snapshots(df):
+        snap_ok = _finite_xy(snap)
+        if snap_ok.shape[0] < 2 or not np.isfinite(rc) or rc <= 0:
+            rows.append((*key, np.nan))
+            continue
+        pts = snap_ok[['x','y']].to_numpy(dtype=float, copy=False)
+        try:
+            tree = cKDTree(pts)
+        except ValueError:
+            # As a last resort, drop any residual bad rows and retry once
+            pts = pts[np.isfinite(pts).all(axis=1)]
+            if pts.shape[0] < 2:
+                rows.append((*key, np.nan)); continue
+            tree = cKDTree(pts)
+        neighs = tree.query_ball_point(pts, rc)
+        degs = np.fromiter((max(0, len(n)-1) for n in neighs), dtype=float)
+        rows.append((*key, float(degs.mean()) if degs.size else np.nan))
+    return pd.DataFrame(rows, columns=keys+['truth_nb'])
+
+
+# ----------------------- Metric: wall-contact fraction --------------------- #
+
+def _distance_to_walls(pts: np.ndarray, x0,x1,y0,y1) -> np.ndarray:
+    dx = np.minimum(pts[:,0]-x0, x1-pts[:,0])
+    dy = np.minimum(pts[:,1]-y0, y1-pts[:,1])
+    return np.minimum(dx, dy)
+
+def truth_wall(df: pd.DataFrame, d0: float) -> pd.DataFrame:
+    keys = snapshot_keys(df)
+    rows = []
+    for key, snap in iter_snapshots(df):
+        snap_ok = _finite_xy(snap)
+        if snap_ok.empty:
+            rows.append((*key, np.nan)); continue
+        x0,x1,y0,y1 = infer_box(snap_ok)
+        pts = snap_ok[['x','y']].to_numpy(dtype=float, copy=False)
+        d = _distance_to_walls(pts, x0,x1,y0,y1)
+        frac = float((d <= d0).mean()) if d.size else np.nan
+        rows.append((*key, frac))
+    return pd.DataFrame(rows, columns=keys+['truth_wall'])
+
+
+# ----------------------------- Join & compare ------------------------------ #
+
+def dispersion_std(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    """
+    Std across robots of a consensus column at each (arena, run, time).
+    (Each row is a robot snapshot, consensus values repeat by design.)
+    """
+    keys = snapshot_keys(df)
+    more = [c for c in ['robot_id'] if c in df.columns]
+    g = df[keys+more+[col]].dropna().groupby(keys, sort=False)[col]
+    return g.std().reset_index(name=f"{col}_std")
+
+def time_lag_sec(truth: pd.Series, est: pd.Series, dt: float) -> float:
+    """
+    Crude lag estimate: argmax of cross-correlation between demeaned series.
+    """
+    a = truth.to_numpy(); b = est.to_numpy()
+    m = np.isfinite(a) & np.isfinite(b)
+    if m.sum() < 3: return np.nan
+    a = a[m] - np.nanmean(a[m]); b = b[m] - np.nanmean(b[m])
+    if a.size != b.size:
+        n = min(a.size, b.size)
+        a, b = a[:n], b[:n]
+    corr = correlate(b, a, mode='full', method='auto')  # est vs truth
+    lags = np.arange(-len(a)+1, len(a))
+    k = int(np.nanargmax(corr))
+    return float(lags[k] * dt)
+
+def summarize_errors(df_join: pd.DataFrame, truth_col: str, est_col: str, by: list[str]) -> pd.DataFrame:
+    def _agg(g):
+        t = g[truth_col].to_numpy(); e = g[est_col].to_numpy()
+        m = np.isfinite(t) & np.isfinite(e)
+        if m.sum() == 0:
+            return pd.Series(dict(bias=np.nan, mae=np.nan, rmse=np.nan, lag_s=np.nan))
+        d = e[m] - t[m]
+        dt = np.median(np.diff(g['time'].to_numpy())) if len(g) >= 2 else 0.0
+        return pd.Series(dict(
+            bias = float(np.mean(d)),
+            mae  = float(np.mean(np.abs(d))),
+            rmse = float(np.sqrt(np.mean(d**2))),
+            lag_s= time_lag_sec(pd.Series(t[m]), pd.Series(e[m]), dt=dt) if dt > 0 else np.nan
+        ))
+
+    grp = df_join.groupby(by, sort=False)
+    # Pandas >= 2.2 supports include_groups=
+    try:
+        res = grp.apply(_agg, include_groups=False).reset_index()
+    except TypeError:
+        # Back-compat for older pandas
+        res = grp.apply(_agg).reset_index()
+
+    return res
+
+
+# --------------------------------- Main ------------------------------------ #
+
+def coverage_report(df: pd.DataFrame):
+    by = [c for c in ['arena_file','run'] if c in df.columns]
+    cols_truth_need = {
+        'pol':  ['angle'],
+        'ang4': ['angle'],
+        'pers': ['angle', 'time'],
+        'vort': ['x','y','time'],  # vx,vy will be derived
+        'nb':   ['x','y'],
+        'wall': ['x','y'],
+    }
+    cons_cols = [
+        'pol_consensus_ewma','ang4_consensus_ewma','pers_consensus_ewma',
+        'vort_consensus_ewma','nb_consensus_ewma','wall_consensus_ewma'
+    ]
+    def _pct(g, cols):
+        m = np.ones(len(g), dtype=bool)
+        for c in cols:
+            if c not in g: return 0.0
+            m &= np.isfinite(g[c].to_numpy())
+        return 100.0 * m.mean()
+    rows = []
+    for key, g in df.groupby(by, sort=False):
+        if not isinstance(key, tuple): key = (key,)
+        row = dict(zip(by, key))
+        for k, need in cols_truth_need.items():
+            row[f"truth_{k}_finite_%"] = _pct(g, need)
+        for c in cons_cols:
+            if c in g:
+                row[f"{c}_finite_%"] = 100.0 * np.isfinite(g[c].to_numpy()).mean()
+            else:
+                row[f"{c}_finite_%"] = -1.0  # column missing
+        rows.append(row)
+    rep = pd.DataFrame(rows).sort_values(by)
+    print("\n[coverage] fraction of finite values per (arena,run)\n", rep.to_string(index=False))
+    return rep
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description="Validate on-robot estimators vs canonical truths.")
+    p.add_argument("-i","--input", required=True, help="Input Feather/CSV from Pogosim")
+    p.add_argument("-o","--output", required=True, help="Output directory")
+    p.add_argument("--d0", type=float, default=40.0, help="Wall distance threshold d0 (mm) for wall-contact truth")
+    p.add_argument("--vort-nx", type=int, default=64, help="Grid Nx for vorticity")
+    p.add_argument("--vort-ny", type=int, default=64, help="Grid Ny for vorticity")
+    p.add_argument("--vort-mode", choices=["signed","abs"], default="abs",
+                   help="Use signed mean(ω) or mean(|ω|) to match local definition")
+    p.add_argument("--pers-lag", type=float, default=None,
+                   help="Lag Δ* (seconds) for velocity persistence truth. If omitted, try to infer from YAML (neighbor_persist_norm_ms or a specific pers lag).")
+    args = p.parse_args(argv)
+
+    os.makedirs(args.output, exist_ok=True)
+
+    df, rc, meta = load_df_and_config(args.input)
+    df = ensure_sorted(df)
+    # global cleanup: turn inf -> NaN then drop rows where x or y is missing
+    df = df.replace([np.inf, -np.inf], np.nan)
+    # keep other NaNs (e.g., angles) for metrics that don't need them,
+    # but x/y must be finite for neighbor graph, wall, vorticity, etc.
+
+    cfg = meta.get("configuration", {}) if isinstance(meta, dict) else {}
+    cfg = cfg.get("parameters", {})
+
+    # Required columns must exist
+    need = {'time','x','y','angle'}
+    miss = need - set(df.columns)
+    if miss:
+        raise ValueError(f"Missing columns in dataframe: {sorted(miss)}")
+
+    df = ensure_sorted(df)
+
+    # Mirror robot EWMAs for each estimator
+    a_pol  = pick_alpha(cfg, 'ewma_alpha_polarization', 0.20)
+    a_ang4 = pick_alpha(cfg, 'ewma_alpha_ang4',         0.20)
+    a_vort = pick_alpha(cfg, 'ewma_alpha_vort',         0.20)
+    a_pers = pick_alpha(cfg, 'ewma_alpha_persistence',  0.10)
+    a_nb   = pick_alpha(cfg, 'ewma_alpha_nb',           0.10)
+    a_wall = pick_alpha(cfg, 'ewma_alpha_wallratio',    0.10)
+
+    # ---- Compute truths (unsmoothed) ----
+    T_pol  = truth_pol(df)
+    T_ang4 = truth_ang4(df)
+    T_vort = truth_vort(df, nx=args.vort_nx, ny=args.vort_ny, mode=args.vort_mode)
+    # Velocity persistence lag
+    lag_s = args.pers_lag
+    if lag_s is None:
+        # Try to infer: if you store a target/inferable lag in YAML, grab it.
+        # Else fallback to neighbor_persist_norm_ms as a proxy (ms -> s).
+        lag_s = float(cfg.get('pers_lag_s', cfg.get('neighbor_persist_norm_ms', 10000))/1000.0)
+    T_pers = truth_pers(df, lag_s=lag_s)
+    T_nb   = truth_nb(df, rc=rc)
+    T_wall = truth_wall(df, d0=args.d0)
+
+    # Quick diagnostics: how many (arena,run,time) snapshots had x/y NaNs?
+    bad_counts = []
+    for key, snap in iter_snapshots(df):
+        n = len(snap)
+        m = np.isfinite(snap['x'].to_numpy()) & np.isfinite(snap['y'].to_numpy())
+        if (~m).any():
+            bad_counts.append((key, int((~m).sum()), int(n)))
+    if bad_counts:
+        print(f"[warn] finite(x,y) drops in {len(bad_counts)} snapshots (showing first 5):")
+        for k, dropped, n in bad_counts[:5]:
+            print("  ", k, f"dropped {dropped}/{n}")
+
+    # Save raw truths
+    for name, tab in dict(pol=T_pol, ang4=T_ang4, vort=T_vort, pers=T_pers, nb=T_nb, wall=T_wall).items():
+        tab.to_csv(os.path.join(args.output, f"truths_{name}.csv"), index=False)
+
+    # ---- Smooth truths with robot alphas ----
+    def _smooth(tab: pd.DataFrame, col: str, alpha: float) -> pd.DataFrame:
+        keys = snapshot_keys(tab)
+        out = []
+        for k, g in tab.groupby([c for c in keys if c!='time'], sort=False):
+            s = g.sort_values('time')
+            sm = ewma_like_robot(s[col], alpha)
+            s = s.copy(); s[f"{col}_ewma"] = sm
+            out.append(s)
+        return pd.concat(out, ignore_index=True)
+
+    T_pol  = _smooth(T_pol,  'truth_pol',  a_pol)
+    T_ang4 = _smooth(T_ang4, 'truth_ang4', a_ang4)
+    if args.vort_mode=="abs":
+        T_vort = _smooth(T_vort, 'truth_vort_abs', a_vort)
+    else:
+        T_vort = _smooth(T_vort, 'truth_vort_signed', a_vort)
+    T_pers = _smooth(T_pers, 'truth_pers', a_pers)
+    T_nb   = _smooth(T_nb,   'truth_nb',   a_nb)
+    T_wall = _smooth(T_wall, 'truth_wall', a_wall)
+
+    # ---- Join with robot consensus and compute dispersion ----
+    # Column names exported by main.c (simulator export): see create_data_schema/export_data
+    # pol_consensus_ewma, wall_consensus_ewma, pers_consensus_ewma, nb_consensus_ewma, ang4_consensus_ewma, vort_consensus_ewma
+    # + per-robot: ..._local. We'll use consensus_* for comparisons. :contentReference[oaicite:2]{index=2}
+    disp_cols = {
+        'pol' : 'pol_consensus_ewma',
+        'ang4': 'ang4_consensus_ewma',
+        'vort': 'vort_consensus_ewma',
+        'pers': 'pers_consensus_ewma',
+        'nb'  : 'nb_consensus_ewma',
+        'wall': 'wall_consensus_ewma',
+    }
+
+    # Compute per-time dispersion (std across robots) for each consensus metric
+    Dstd = {}
+    for k, col in disp_cols.items():
+        if col in df.columns:
+            Dstd[k] = dispersion_std(df, col)
+
+    by = [c for c in ['arena_file','run'] if c in df.columns]
+
+    # Build consensus slices once:
+    cons_cols = {
+        'pol':'pol_consensus_ewma',
+        'ang4':'ang4_consensus_ewma',
+        'vort':'vort_consensus_ewma',
+        'pers':'pers_consensus_ewma',
+        'nb':'nb_consensus_ewma',
+        'wall':'wall_consensus_ewma'
+    }
+    CONS = {k: (df[by+['time',v]].dropna(subset=[v]) if v in df.columns else pd.DataFrame(columns=by+['time',v]))
+            for k,v in cons_cols.items()}
+
+    # Choose the EWMA'd truth column names produced earlier:
+    t_pol  = 'truth_pol_ewma'
+    t_ang4 = 'truth_ang4_ewma'
+    t_vabs = 'truth_vort_abs_ewma'   # or 'truth_vort_signed_ewma' if signed
+    t_pers = 'truth_pers_ewma'
+    t_nb   = 'truth_nb_ewma'
+    t_wall = 'truth_wall_ewma'
+
+    C_pol  = align_truth_consensus(T_pol,  t_pol,  CONS['pol'],  cons_cols['pol'],  by)
+    C_ang4 = align_truth_consensus(T_ang4, t_ang4, CONS['ang4'], cons_cols['ang4'], by)
+    C_vort = align_truth_consensus(T_vort, t_vabs, CONS['vort'], cons_cols['vort'], by)
+    C_pers = align_truth_consensus(T_pers, t_pers, CONS['pers'], cons_cols['pers'], by)
+    C_nb   = align_truth_consensus(T_nb,   t_nb,   CONS['nb'],   cons_cols['nb'],   by)
+    C_wall = align_truth_consensus(T_wall, t_wall, CONS['wall'], cons_cols['wall'], by)
+
+    # ---------- Save aligned comparisons (force using aligned C_*) ----------
+    outdir = args.output
+    C_tables = {
+        'pol' : C_pol,
+        'ang4': C_ang4,
+        'vort': C_vort,
+        'pers': C_pers,
+        'nb'  : C_nb,
+        'wall': C_wall,
+    }
+    for name, tab in C_tables.items():
+        path = os.path.join(outdir, f"compare_{name}.csv")
+        tab.to_csv(path, index=False)
+
+    # ---------- Finite-pair sanity counters (what the summary will actually use) ----------
+    def finite_pair_table(C: pd.DataFrame, by=('arena_file','run')):
+        if C.empty:
+            return pd.DataFrame(columns=[*by, 'finite_pairs'])
+        m = np.isfinite(C['truth'].to_numpy()) & np.isfinite(C['consensus'].to_numpy())
+        CC = C.loc[m, list(by)]
+        cnt = CC.groupby(list(by), sort=False).size().reset_index(name='finite_pairs')
+        return cnt
+
+    print("\n[finite pairs used in summary]")
+    for name, C in C_tables.items():
+        tbl = finite_pair_table(C)
+        print(f"{name}:\n", (tbl.to_string(index=False) if not tbl.empty else "(none)"))
+
+    # ---------- Summaries (use the aligned C_* ONLY) ----------
+    keys = [c for c in ['arena_file','run'] if c in df.columns]
+
+    S_pol  = summarize_errors(C_pol,  'truth', 'consensus', keys)
+    S_ang4 = summarize_errors(C_ang4, 'truth', 'consensus', keys)
+    S_vort = summarize_errors(C_vort, 'truth', 'consensus', keys)
+    S_pers = summarize_errors(C_pers, 'truth', 'consensus', keys)
+    S_nb   = summarize_errors(C_nb,   'truth', 'consensus', keys)
+    S_wall = summarize_errors(C_wall, 'truth', 'consensus', keys)
+
+    # ---------- Write text summary from these S_* ----------
+    lines = ["# Estimator validation — per-arena / per-run summary\n"]
+    def add_block(name, S):
+        lines.append(f"\n## {name}\n")
+        if S.empty:
+            lines.append("no data\n")
+            return
+        for _, r in S.iterrows():
+            label = " ".join(f"{k}={r[k]}" for k in keys) if keys else "(all)"
+            b, a, rm, lg = r['bias'], r['mae'], r['rmse'], r['lag_s']
+            lines.append(f"- {label}: bias={b:.4f}, MAE={a:.4f}, RMSE={rm:.4f}, lag≈{(0.0 if pd.isna(lg) else lg):.3f}s")
+
+    add_block("pol",  S_pol)
+    add_block("ang4 (A4 harmonic)", S_ang4)
+    add_block("vort", S_vort)
+    add_block(f"pers (C_v at Δ*={float(lag_s):.3f}s)", S_pers)
+    add_block("nb (mean degree)", S_nb)
+    add_block(f"wall (d0={args.d0:.1f} mm)", S_wall)
+
+    with open(os.path.join(outdir, "SUMMARY_estimator_validation.txt"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+    # Also dump the exact alphas used (for traceability)
+    with open(os.path.join(args.output, "bandwidths_used.json"), "w") as f:
+        json.dump(dict(
+            ewma_alpha_polarization=a_pol,
+            ewma_alpha_ang4=a_ang4,
+            ewma_alpha_vort=a_vort,
+            ewma_alpha_persistence=a_pers,
+            ewma_alpha_nb=a_nb,
+            ewma_alpha_wallratio=a_wall,
+            pers_lag_s=float(lag_s),
+            rc_neighbor=float(rc),
+            vort_grid=[int(args.vort_nx), int(args.vort_ny)],
+            vort_mode=args.vort_mode,
+            wall_d0_mm=float(args.d0),
+        ), f, indent=2)
+
+    print(f"Done. Outputs in: {args.output}")
+    coverage_report(df)
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())
+

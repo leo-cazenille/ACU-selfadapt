@@ -1,0 +1,40 @@
+\documentclass{standalone}
+\usepackage[export]{adjustbox} % for \adjincludegraphics and \height in trim
+\usepackage{graphicx}
+\usepackage{array}
+\usepackage{booktabs}
+
+% Compact column: centered paragraph of fixed width
+\newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}}
+
+\newcommand{\pimg}[1]{%
+  \adjincludegraphics[width=3cm,clip,trim=18 23 18 5]{imgs/#1}%
+}
+
+\begin{document}
+
+% Tighten spacing between columns and rows
+\setlength{\tabcolsep}{2pt}
+\renewcommand{\arraystretch}{1.0}
+
+\begin{tabular}{@{} C{3cm} @{\hspace{6pt}} C{3cm} @{\hspace{6pt}} C{3cm} @{\hspace{6pt}} C{3cm} @{\hspace{6pt}} C{3cm} @{}}
+
+  \pimg{global_pol-violin.pdf} &
+  \pimg{local_pol-violin.pdf} \\
+
+  \pimg{global_wall-violin.pdf} &
+  \pimg{local_wall-violin.pdf} \\
+
+  \pimg{global_pers-violin.pdf} &
+  \pimg{local_pers-violin.pdf} \\
+
+%  \pimg{global_nb-violin.pdf} &
+%  \pimg{local_nb-violin.pdf} \\
+%
+%  \pimg{global_ang4-violin.pdf} &
+%  \pimg{local_ang4-violin.pdf} \\
+
+\end{tabular}
+
+\end{document}
+

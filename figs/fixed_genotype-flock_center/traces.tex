@@ -1,0 +1,49 @@
+\documentclass{standalone}
+\usepackage{graphicx}
+\usepackage[export]{adjustbox} % for \adjincludegraphics and \height in trim
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{rotating}
+
+\usepackage{amsmath}
+\usepackage[T1]{fontenc}
+\usepackage{helvet}
+\renewcommand{\familydefault}{\sfdefault}
+\usepackage[helvet]{sfmath}
+\everymath={\sf}
+
+% Centered "p" columns
+\newcolumntype{C}[1]{>{\centering\arraybackslash}p{#1}}
+
+% Image helper (your working crop and path)
+\newcommand{\img}[1]{%
+  \adjincludegraphics[width=3cm,clip,trim=0 0 0 23]{imgs/#1}%
+}
+
+\begin{document}
+
+\centering
+
+%\begin{tabular}{@{}C{0.1cm} @{\hspace{6pt}} C{3cm} @{\hspace{0pt}} C{3cm} @{\hspace{0pt}} C{3cm} @{\hspace{0pt}} C{3cm}@{}}
+%   & \rotatebox{0}{\textbf{torus}} & \rotatebox{0}{\textbf{disk}}
+%   & \rotatebox{0}{\textbf{star}}  & \rotatebox{0}{\textbf{H}} \\
+%   %\midrule
+%    \rotatebox{90}{\hspace{20pt}\textbf{no bias}}     & \img{torus_noiseless.png} & \img{disk_noiseless.png}
+%                        & \img{star_noiseless.png}  & \img{H_noiseless.png} \\
+%   \rotatebox{90}{\hspace{13pt}\textbf{strong bias}} & \img{torus_strong_noise.png} & \img{disk_strong_noise.png}
+%                        & \img{star_strong_noise.png}  & \img{H_strong_noise.png} \\
+%\end{tabular}
+
+\begin{tabular}{@{}C{0.1cm} @{\hspace{3pt}} C{3cm} @{\hspace{0pt}} C{3cm} @{\hspace{0pt}} C{3cm}@{}}
+   & \rotatebox{0}{\scriptsize\textbf{torus}} & \rotatebox{0}{\scriptsize\textbf{disk}}
+   & \rotatebox{0}{\scriptsize\textbf{star}}  \\
+   %\midrule
+    \rotatebox{90}{\hspace{28pt}\scriptsize\textbf{no bias}}     & \img{torus_noiseless.png} & \img{disk_noiseless.png}
+                        & \img{star_noiseless.png}  \\
+   \rotatebox{90}{\hspace{19pt}\scriptsize\textbf{robot biases}} & \img{torus_strong_noise.png} & \img{disk_strong_noise.png}
+                        & \img{star_strong_noise.png}  \\
+\end{tabular}
+
+
+\end{document}
+

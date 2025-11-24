@@ -1,0 +1,7 @@
+numpy>=2.1.3
+pandas>=2.3.1
+matplotlib>=3.9.0
+seaborn>=0.13.2
+cblind>=2.3.2
+pogosim>=0.10.8
+shapely>=2.1.0
