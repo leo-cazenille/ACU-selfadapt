@@ -1338,6 +1338,9 @@ static opt_cfg_t create_opt_cfg() {
             init_float_from_configuration(&c.P.hit.alpha_sigma, "optimizer.hit.alpha_sigma", 1e-3f); /* mutation stddev on α */
             init_float_from_configuration(&c.P.hit.alpha_min  , "optimizer.hit.alpha_min",   0.0f);  /* clamp α to [0, 0.9] */
             init_float_from_configuration(&c.P.hit.alpha_max  , "optimizer.hit.alpha_max",   0.9f);  /* clamp α to [0, 0.9] */
+            init_bool_from_configuration(&c.P.hit.auto_sigma  , "optimizer.hit.auto_sigma", false);  /* whether to adapt sigma dynamically from the current loss */
+            init_float_from_configuration(&c.P.hit.loss_mut_gain, "optimizer.hit.loss_mut_gain", 0.5f);
+            init_float_from_configuration(&c.P.hit.loss_mut_clip, "optimizer.hit.loss_mut_clip", 1.0f);
         } break;
     }
     return c;
