@@ -96,12 +96,37 @@ for i in $(cd results/selfadapt-ACU-torus_disk_star-32run; ls *feather); do echo
 ```
 
 
+---
+
 ## Self-Adaptive Controller Parameters
 
 This repository contains the implementation of the self-adaptive swarm controller
 described in the accompanying ANTS paper.  
 Below we summarize the main parameters, hyper-parameters, and target statistics
 used in the experiments. Full details can be found in the source code.
+
+---
+
+## ACU Motility Model Parameters
+
+The table below lists the parameters of the **ACU (Alignment with Crowding and U-turns)** motility model used in the experiments.  
+Parameters marked as *in genotype* are optimized online by the self-adaptive controller; the others are fixed hyper-parameters.
+
+| Symbol / Name | In genotype? | Domain / Units | Description |
+|---|---|---|---|
+| `v₀` (base linear speed) | Yes | `[0, 1]` mm·s⁻¹ | Baseline commanded speed before crowding adjustment, in normalized units (`1.0` = maximum robot speed). |
+| `β` (alignment gain) | Yes | `[0, 1]` s⁻¹ | Strength of the Vicsek alignment torque toward the commanded heading `θ*`. |
+| `σ` (angular noise) | Yes | `[0, 1]` s⁻¹ | Standard deviation of angular diffusion. |
+| `φ_norm` (normalized turn) | Yes | `[0, 1]` | Normalized phase offset; the absolute angular offset is `φ = 2π · φ_norm` (rad). |
+| `d_crowd` (slowdown depth) | Yes | `[0, 1]` | Maximum relative slowdown when the local neighbor count is close to `N_tgt`. |
+| `N_tgt` (target neighbors) | No | `[0, 20]` | Desired neighbor count around which the speed policy is neutral. |
+| `w_n` (width in neighbors) | No | `4.0` | Width controlling how quickly speed recovers as `|d_i − N_tgt|` increases. |
+| `τ_ut` (U-turn duration) | No | `1.5 s` | Fixed activation window for the U-turn heading override. |
+| Neighbor timeout | No | `1.0 s` | Time after which a stored neighbor is considered stale and discarded. |
+| Integration clamp | No | `0.05 s` | Maximum internal integration time step used for numerical stability. |
+
+**Note:**  
+All continuous parameters are normalized to `[0,1]` when included in the genotype, simplifying decentralized online optimization.
 
 ---
 
@@ -155,4 +180,55 @@ The table below lists the target values and weights used for each goal.
 **Note:**  
 These values correspond to the experimental setup reported in the ANTS paper.
 They can be modified to explore alternative swarm behaviors or optimization regimes.
+
+## Simulation Results: Time to Reach Loss Targets
+
+The table below summarizes simulation results over **32 independent runs**.
+For each configuration, we report the **mean ± std** time (in simulation seconds)
+to reach different loss thresholds (`L ≤ 0.30`, `0.25`, `0.20`, `0.15`, `0.10`),
+as well as the number of runs `n` that successfully reached each target.
+
+Only configurations with **at least 5 runs** reaching a given target are considered
+when identifying minimal convergence times (shown in **bold**).
+
+---
+
+### Convergence Times Across Algorithms and Conditions
+
+| Algorithm | FT | Arena | Biases | t(L≤0.30) ± std | n | t(L≤0.25) ± std | n | t(L≤0.20) ± std | n | t(L≤0.15) ± std | n | t(L≤0.10) ± std | n |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1+1-ES | No | torus | No | 377.3 ± 366.9 | 28 | – | – | – | – | – | – | – | – |
+| 1+1-ES | No | torus | Yes | 877.6 ± 415.5 | 7 | – | – | – | – | – | – | – | – |
+| 1+1-ES | No | disk | No | 152.6 ± 98.9 | 32 | – | – | – | – | – | – | – | – |
+| 1+1-ES | No | disk | Yes | 560.3 ± 322.1 | 22 | – | – | – | – | – | – | – | – |
+| 1+1-ES | No | star | No | 313.1 ± 262.2 | 31 | – | – | – | – | – | – | – | – |
+| 1+1-ES | No | star | Yes | 799.1 ± 289.3 | 16 | – | – | – | – | – | – | – | – |
+| 1+1-ES | Yes | torus | No | 45.6 ± 13.7 | 32 | 90.7 ± 63.5 | 32 | 197.3 ± 114.5 | 29 | **328.9 ± 266.9** | 16 | – | – |
+| 1+1-ES | Yes | torus | Yes | 73.2 ± 43.6 | 32 | 202.9 ± 127.8 | 29 | 507.4 ± 330.8 | 14 | – | 3 | – | – |
+| 1+1-ES | Yes | disk | No | 44.4 ± 13.2 | 32 | **92.5 ± 49.5** | 32 | 244.8 ± 185.3 | 30 | **455.9 ± 357.9** | 14 | – | 2 |
+| 1+1-ES | Yes | disk | Yes | **76.9 ± 41.0** | 32 | 276.8 ± 198.1 | 30 | **523.3 ± 285.4** | 13 | – | 2 | – | – |
+| 1+1-ES | Yes | star | No | 60.0 ± 36.7 | 32 | 174.3 ± 211.4 | 31 | 386.3 ± 264.4 | 26 | **486.9 ± 349.8** | 15 | – | – |
+| 1+1-ES | Yes | star | Yes | **110.1 ± 51.1** | 32 | 451.9 ± 270.0 | 29 | 876.4 ± 383.6 | 10 | – | – | – | – |
+| HIT | No | torus | No | 323.3 ± 203.7 | 32 | – | – | – | – | – | – | – | – |
+| HIT | No | torus | Yes | 770.7 ± 378.3 | 29 | – | 1 | – | – | – | – | – | – |
+| HIT | No | disk | No | 158.8 ± 128.6 | 32 | 908.0 ± 294.7 | 8 | – | – | – | – | – | – |
+| HIT | No | disk | Yes | 532.1 ± 246.4 | 32 | – | 4 | – | – | – | – | – | – |
+| HIT | No | star | No | 477.7 ± 339.5 | 32 | – | 2 | – | – | – | – | – | – |
+| HIT | No | star | Yes | 670.3 ± 294.7 | 30 | – | 2 | – | – | – | – | – | – |
+| HIT | Yes | torus | No | **45.0 ± 13.4** | 32 | **85.0 ± 26.9** | 32 | **174.3 ± 93.2** | 31 | 414.9 ± 242.0 | 30 | – | 1 |
+| HIT | Yes | torus | Yes | **70.0 ± 43.1** | 32 | **171.3 ± 89.6** | 32 | **497.7 ± 288.5** | 31 | **878.3 ± 284.9** | 19 | – | – |
+| HIT | Yes | disk | No | **42.5 ± 15.0** | 32 | 115.1 ± 94.1 | 32 | **205.3 ± 118.2** | 31 | 538.1 ± 351.1 | 28 | **885.4 ± 256.7** | 12 |
+| HIT | Yes | disk | Yes | 77.5 ± 37.3 | 32 | **202.0 ± 116.4** | 32 | 595.6 ± 340.4 | 30 | **849.8 ± 280.6** | 15 | – | – |
+| HIT | Yes | star | No | **58.2 ± 32.7** | 32 | **131.3 ± 69.5** | 32 | **333.3 ± 238.5** | 32 | 658.7 ± 371.4 | 25 | – | 1 |
+| HIT | Yes | star | Yes | 117.6 ± 83.6 | 32 | **304.7 ± 189.0** | 31 | **648.9 ± 319.1** | 28 | – | 3 | – | – |
+
+---
+
+**Legend**
+- `FT`: Fast Transmission enabled (`Yes` / `No`)
+- `Biases`: presence of robot hardware biases
+- `n`: number of runs (out of 32) reaching the corresponding loss target
+- `–`: fewer than 5 runs reached the target
+- **Bold values** indicate minimal convergence times among eligible configurations
+
 
